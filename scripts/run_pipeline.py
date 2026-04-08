@@ -75,15 +75,16 @@ def main():
     hmm_full.fit(hmm_feat[HMM_FEATURES].values)
     print(f"      Log-likelihood: {hmm_full.log_likelihood:.4f}")
 
-    posteriors = hmm_full.predict_proba(hmm_feat[HMM_FEATURES].values)
+    X_hmm = hmm_feat[HMM_FEATURES].values
+    posteriors = hmm_full.predict_proba(X_hmm)
     raw_states, confidence, entropy = extract_regime_series(posteriors)
 
-    # Data-driven state map: sort by actual observed forward return per state
-    fwd_ret = np.log(df["close"].shift(-24) / df["close"]).reindex(hmm_feat.index).values
+    # Sort states by concurrent features (no look-ahead bias)
     state_map = build_state_map(
         hmm_full,
+        X_raw=X_hmm,
         raw_states=raw_states,
-        forward_returns=fwd_ret,
+        feature_names=HMM_FEATURES,
     )
 
     regime_state = apply_state_map(raw_states, state_map)

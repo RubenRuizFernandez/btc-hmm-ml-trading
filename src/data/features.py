@@ -27,16 +27,15 @@ def build_hmm_features(df: pd.DataFrame) -> pd.DataFrame:
     out["log_return_1h"] = log_ret
     out["log_return_4h"] = np.log(df["close"] / df["close"].shift(4))
     out["log_return_24h"] = np.log(df["close"] / df["close"].shift(24))
+    out["log_return_168h"] = np.log(df["close"] / df["close"].shift(168))
 
     out["realized_vol_24h"] = log_ret.rolling(24, min_periods=24).std() * np.sqrt(24)
     out["realized_vol_168h"] = log_ret.rolling(168, min_periods=168).std() * np.sqrt(168)
     out["vol_ratio"] = out["realized_vol_24h"] / (out["realized_vol_168h"] + 1e-10)
 
-    out["price_range_norm"] = (df["high"] - df["low"]) / (df["close"] + 1e-10)
-
-    vol_mean = df["volume"].rolling(168, min_periods=168).mean()
-    vol_std = df["volume"].rolling(168, min_periods=168).std()
-    out["volume_zscore"] = (df["volume"] - vol_mean) / (vol_std + 1e-10)
+    # Trend position: where price sits relative to 30-day SMA
+    sma_720 = df["close"].rolling(720, min_periods=168).mean()
+    out["trend_sma_720"] = (df["close"] - sma_720) / (sma_720 + 1e-10)
 
     return out.dropna()
 

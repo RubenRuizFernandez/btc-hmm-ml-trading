@@ -9,7 +9,7 @@ Simulates a bar-by-bar strategy with:
 import numpy as np
 import pandas as pd
 
-from src.config import FEE_RATE, SLIPPAGE_BPS
+from src.config import FEE_RATE, SLIPPAGE_BPS, MAX_POSITION
 from src.backtest.metrics import compute_metrics
 from src.backtest.sizing import compute_position_sizes
 
@@ -165,3 +165,104 @@ def _exit_price(px: float, position: float) -> float:
 def _same_direction(desired: float, position: float) -> bool:
     """True if desired and current position are in the same direction."""
     return np.sign(desired) == np.sign(position) and desired != 0.0
+
+
+# ─── Regime-based backtest ───────────────────────────────────────────────────
+
+
+def run_regime_backtest(
+    close: pd.Series,
+    regime_positions: pd.Series,
+    initial_capital: float = 1.0,
+) -> BacktestResult:
+    """
+    Backtest with direct regime-based position sizing.
+
+    Parameters
+    ----------
+    close             : hourly closing prices
+    regime_positions  : desired position fraction per bar (signed).
+                        Positive = long, negative = short, 0 = flat.
+                        Values > 1.0 indicate leveraged positions.
+    initial_capital   : starting portfolio value (default 1.0)
+
+    Position changes happen when regime_positions changes value.
+    Fees and slippage are applied on each entry/exit.
+    """
+    close = close.reindex(regime_positions.index)
+    n = len(regime_positions)
+    pos_arr = regime_positions.values.astype(float)
+    px = close.values.astype(float)
+
+    equity_arr = np.full(n, initial_capital)
+    cash = float(initial_capital)
+    position = 0.0
+    entry_price = 0.0
+    entry_bar = -1
+    trade_rows = []
+
+    for i in range(n):
+        desired = pos_arr[i]
+
+        # ── Close current position if target changed ─────────────────────────
+        if position != 0.0 and abs(desired - position) > 0.01:
+            fill_px = _exit_price(px[i], position)
+            gross_pnl = abs(position) * (fill_px / entry_price - 1.0) * np.sign(position)
+            net_pnl = gross_pnl - abs(position) * FEE_RATE
+            cash = cash * (1.0 + net_pnl)
+            trade_rows.append({
+                "entry_bar": entry_bar,
+                "exit_bar": i,
+                "direction": position,
+                "entry_price": entry_price,
+                "exit_price": fill_px,
+                "pnl_pct": net_pnl,
+                "pnl": cash * net_pnl,
+            })
+            position = 0.0
+            entry_price = 0.0
+
+        # ── Open new position if desired and currently flat ──────────────────
+        if abs(desired) > 0.01 and position == 0.0:
+            fill_px = _entry_price(px[i], desired)
+            cash *= (1.0 - abs(desired) * FEE_RATE)
+            entry_price = fill_px
+            position = desired
+            entry_bar = i
+
+        # ── Mark-to-market equity ────────────────────────────────────────────
+        if position != 0.0 and entry_price > 0:
+            mtm_pnl = abs(position) * (px[i] / entry_price - 1.0) * np.sign(position)
+            equity_arr[i] = cash * (1.0 + mtm_pnl)
+        else:
+            equity_arr[i] = cash
+
+    # ── Close open position at final bar ─────────────────────────────────────
+    if position != 0.0:
+        i = n - 1
+        fill_px = _exit_price(px[i], position)
+        gross_pnl = abs(position) * (fill_px / entry_price - 1.0) * np.sign(position)
+        net_pnl = gross_pnl - abs(position) * FEE_RATE
+        cash = cash * (1.0 + net_pnl)
+        equity_arr[i] = cash
+        trade_rows.append({
+            "entry_bar": entry_bar,
+            "exit_bar": i,
+            "direction": position,
+            "entry_price": entry_price,
+            "exit_price": fill_px,
+            "pnl_pct": net_pnl,
+            "pnl": cash * net_pnl,
+        })
+
+    idx = regime_positions.index
+    eq_series = pd.Series(equity_arr, index=idx, name="equity")
+    trades_df = (
+        pd.DataFrame(trade_rows)
+        if trade_rows
+        else pd.DataFrame(
+            columns=["entry_bar", "exit_bar", "direction",
+                     "entry_price", "exit_price", "pnl_pct", "pnl"]
+        )
+    )
+    return BacktestResult(eq_series, trades_df, regime_positions)

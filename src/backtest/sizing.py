@@ -1,6 +1,9 @@
-"""Position sizing: fractional Kelly scaled by regime confidence."""
+"""Position sizing: fractional Kelly and regime-based sizing."""
 import numpy as np
-from src.config import KELLY_FRACTION, MAX_POSITION, REGIME_CONFIDENCE_THRESHOLD
+from src.config import (
+    KELLY_FRACTION, MAX_POSITION, REGIME_CONFIDENCE_THRESHOLD,
+    REGIME_MULTIPLIER, BASE_POSITION_UNIT,
+)
 
 
 def kelly_size(win_rate: float, avg_win: float, avg_loss: float) -> float:
@@ -60,3 +63,27 @@ def compute_position_sizes(
     )
     sizes = kelly_base * factor
     return np.clip(sizes, 0.0, MAX_POSITION)
+
+
+def compute_regime_positions(
+    regime_states: np.ndarray,
+    multiplier_map: dict = REGIME_MULTIPLIER,
+    base_unit: float = BASE_POSITION_UNIT,
+    max_position: float = MAX_POSITION,
+) -> np.ndarray:
+    """
+    Compute position fractions directly from regime states.
+
+    Returns signed position fractions:
+      Super Bull (0) → +3 * base_unit = +1.50
+      Strong Bull (1) → +2 * base_unit = +1.00
+      Bull (2) → +1 * base_unit = +0.50
+      Sideways (3) → 0
+      Bear (4) → -1 * base_unit = -0.50
+      Strong Bear (5) → -2 * base_unit = -1.00
+      Super Bear (6) → -3 * base_unit = -1.50
+    """
+    positions = np.array([
+        multiplier_map.get(int(s), 0) * base_unit for s in regime_states
+    ])
+    return np.clip(positions, -max_position, max_position)

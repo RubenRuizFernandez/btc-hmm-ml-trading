@@ -7,15 +7,15 @@ from plotly.subplots import make_subplots
 
 from src.config import REGIME_LABELS
 
-# 7-colour palette for regimes (dark→green for bull, grey for sideways, red for bear)
+# 7-colour palette for regimes
 REGIME_COLORS = [
-    "#00c853",  # 0 Strong Bull  — vivid green
-    "#66bb6a",  # 1 Bull         — medium green
-    "#a5d6a7",  # 2 Weak Bull    — light green
+    "#00c853",  # 0 Super Bull   — vivid green
+    "#66bb6a",  # 1 Strong Bull  — medium green
+    "#a5d6a7",  # 2 Bull         — light green
     "#bdbdbd",  # 3 Sideways     — grey
-    "#ef9a9a",  # 4 Weak Bear    — light red
-    "#e57373",  # 5 Bear         — medium red
-    "#c62828",  # 6 Strong Bear  — dark red
+    "#ef9a9a",  # 4 Bear         — light red
+    "#e57373",  # 5 Strong Bear  — medium red
+    "#c62828",  # 6 Super Bear   — dark red
 ]
 REGIME_COLORS_RGBA = [
     f"rgba({int(c[1:3],16)},{int(c[3:5],16)},{int(c[5:7],16)},0.18)"
@@ -101,8 +101,8 @@ def regime_price_chart(
     # ── Buy/sell signals ───────────────────────────────────────────────────────
     if signals is not None:
         sig_plot = signals.reindex(idx, method="ffill").fillna(0)
-        longs = sig_plot[sig_plot == 1]
-        shorts = sig_plot[sig_plot == -1]
+        longs = sig_plot[sig_plot > 0]
+        shorts = sig_plot[sig_plot < 0]
         if len(longs):
             fig.add_trace(
                 go.Scatter(
@@ -175,7 +175,59 @@ def regime_price_chart(
     return fig
 
 
-# ─── Tab 2: Performance ───────────────────────────────────────────────────────
+# ─── Tab 2: Performance Comparison ──────────────────────────────────────────
+
+def equity_comparison_chart(
+    strat_equity: pd.Series,
+    bh_equity: pd.Series,
+) -> go.Figure:
+    """Strategy vs Buy & Hold equity curves with drawdown."""
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[0.7, 0.3],
+        subplot_titles=["Strategy vs Buy & Hold", "Drawdown (%)"],
+    )
+    fig.add_trace(
+        go.Scatter(x=strat_equity.index, y=strat_equity.values,
+                   name="Regime Strategy",
+                   line=dict(color="#42a5f5", width=2.5)),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=bh_equity.index, y=bh_equity.values,
+                   name="Buy & Hold",
+                   line=dict(color="#9e9e9e", width=2, dash="dot")),
+        row=1, col=1,
+    )
+
+    # Strategy drawdown
+    rm_strat = strat_equity.cummax()
+    dd_strat = (strat_equity - rm_strat) / rm_strat * 100
+    fig.add_trace(
+        go.Scatter(x=dd_strat.index, y=dd_strat.values,
+                   name="Strategy DD", fill="tozeroy",
+                   line=dict(color="#42a5f5", width=1),
+                   fillcolor="rgba(66,165,245,0.15)"),
+        row=2, col=1,
+    )
+    # B&H drawdown
+    rm_bh = bh_equity.cummax()
+    dd_bh = (bh_equity - rm_bh) / rm_bh * 100
+    fig.add_trace(
+        go.Scatter(x=dd_bh.index, y=dd_bh.values,
+                   name="B&H DD",
+                   line=dict(color="#9e9e9e", width=1, dash="dot")),
+        row=2, col=1,
+    )
+
+    fig.update_layout(
+        height=550, paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+        font=dict(color="#fafafa"), margin=dict(l=40, r=20, t=60, b=20),
+    )
+    fig.update_yaxes(gridcolor="#1e2128")
+    return fig
+
 
 def equity_chart(
     equity_curve: pd.Series,
@@ -255,7 +307,33 @@ def trade_histogram(trades: pd.DataFrame) -> go.Figure:
     return fig
 
 
-# ─── Tab 3: Walk-Forward Matrix ───────────────────────────────────────────────
+def regime_distribution_chart(regime_state: pd.Series) -> go.Figure:
+    """Bar chart showing time spent in each regime."""
+    counts = regime_state.value_counts().sort_index()
+    total = counts.sum()
+    labels = [REGIME_LABELS[int(i)] for i in counts.index]
+    pcts = (counts / total * 100).values
+
+    fig = go.Figure(
+        go.Bar(
+            x=labels,
+            y=pcts,
+            marker_color=[REGIME_COLORS[int(i)] for i in counts.index],
+            text=[f"{p:.1f}%" for p in pcts],
+            textposition="auto",
+        )
+    )
+    fig.update_layout(
+        title="Time in Each Regime (%)",
+        height=350, paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+        font=dict(color="#fafafa"),
+        yaxis_title="% of Time",
+        showlegend=False,
+    )
+    return fig
+
+
+# ─── Walk-Forward Matrix ────────────────────────────────────────────────────
 
 def wf_matrix_heatmap(summary: pd.DataFrame) -> go.Figure:
     metric_cols = [
@@ -331,7 +409,7 @@ def wf_return_bars(summary: pd.DataFrame) -> go.Figure:
     return fig
 
 
-# ─── Tab 4: Model Insights ────────────────────────────────────────────────────
+# ─── Model Insights ─────────────────────────────────────────────────────────
 
 def shap_importance_chart(importance: pd.Series, top_n: int = 20) -> go.Figure:
     top = importance.head(top_n).sort_values()

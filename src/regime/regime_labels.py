@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-from src.config import REGIME_LABELS, REGIME_DIRECTION, HMM_FEATURES
+from src.config import REGIME_LABELS, REGIME_DIRECTION, HMM_FEATURES, MIN_REGIME_BARS
 
 
 def build_state_map(
@@ -22,38 +22,77 @@ def build_state_map(
     """
     Return a mapping {raw_state_index → semantic_label_index}.
 
-    Preferred method (when X_raw + raw_states + forward_returns are provided):
-      Sort by mean forward 24h log-return actually observed in each state.
-      This is data-driven and avoids scaled-space ordering errors.
+    Method 1 (WF folds — forward_returns provided):
+      Sort by mean forward 24h log-return per state from IS data.
 
-    Fallback (means_ in scaled space):
-      score = 0.5 * mean(log_return_24h) + 0.3 * mean(log_return_4h)
-              - 0.2 * mean(realized_vol_24h)
+    Method 2 (full-period fit — X_raw + raw_states, no forward_returns):
+      Sort by concurrent feature means (log_return_24h + log_return_168h).
+      No look-ahead bias.
+
+    Method 3 (fallback):
+      Use scaled-space means from HMM.
     """
     n_states = hmm_model.n_states
 
     if raw_states is not None and forward_returns is not None:
-        # Data-driven: sort states by their actual mean forward return
+        # Method 1: sort by actual mean forward return (valid for IS data)
         scores = np.array([
             forward_returns[raw_states == s].mean() if (raw_states == s).any() else 0.0
             for s in range(n_states)
         ])
+    elif X_raw is not None and raw_states is not None:
+        # Method 2: sort by concurrent observed returns (no look-ahead)
+        idx_ret24 = feature_names.index("log_return_24h")
+        idx_ret168 = feature_names.index("log_return_168h") if "log_return_168h" in feature_names else idx_ret24
+        scores = np.array([
+            0.5 * X_raw[raw_states == s, idx_ret24].mean()
+            + 0.5 * X_raw[raw_states == s, idx_ret168].mean()
+            if (raw_states == s).any() else 0.0
+            for s in range(n_states)
+        ])
     else:
-        # Fallback: use scaled means
+        # Method 3: fallback using scaled means
         means = hmm_model.means_
         idx_ret24 = feature_names.index("log_return_24h")
         idx_ret4  = feature_names.index("log_return_4h")
-        idx_vol24 = feature_names.index("realized_vol_24h")
-        scores = (
-            0.5 * means[:, idx_ret24]
-            + 0.3 * means[:, idx_ret4]
-            - 0.2 * means[:, idx_vol24]
-        )
+        scores = 0.6 * means[:, idx_ret24] + 0.4 * means[:, idx_ret4]
 
-    # sort descending: highest score → Strong Bull (label 0)
+    # sort descending: highest score → Super Bull (label 0)
     sorted_raw = np.argsort(scores)[::-1]
     state_map = {int(raw): int(label) for label, raw in enumerate(sorted_raw)}
     return state_map
+
+
+def smooth_regimes(
+    regime_series: pd.Series,
+    min_duration: int = MIN_REGIME_BARS,
+) -> pd.Series:
+    """
+    Causal regime smoothing — require a new regime to persist for
+    min_duration bars before confirming the switch.
+
+    Prevents whipsaw from noisy HMM transitions.
+    """
+    smoothed = regime_series.copy()
+    vals = smoothed.values.copy()
+    current_regime = int(vals[0])
+    candidate = current_regime
+    candidate_count = 0
+
+    for i in range(1, len(vals)):
+        raw = int(vals[i])
+        if raw == candidate:
+            candidate_count += 1
+        else:
+            candidate = raw
+            candidate_count = 1
+
+        if candidate_count >= min_duration and candidate != current_regime:
+            current_regime = candidate
+
+        vals[i] = current_regime
+
+    return pd.Series(vals, index=regime_series.index, name=regime_series.name)
 
 
 def apply_state_map(raw_states: np.ndarray, state_map: dict) -> np.ndarray:

@@ -9,13 +9,13 @@ from src.data.loader import load_raw
 from src.config import REGIME_LABELS
 
 COLORS = {
-    0: "#00e676",   # Strong Bull  — vivid green
-    1: "#69f0ae",   # Bull         — light green
-    2: "#b9f6ca",   # Weak Bull    — very light green
+    0: "#00e676",   # Super Bull   — vivid green
+    1: "#69f0ae",   # Strong Bull  — light green
+    2: "#b9f6ca",   # Bull         — very light green
     3: "#90a4ae",   # Sideways     — grey
-    4: "#ffb300",   # Weak Bear    — amber
-    5: "#ff5252",   # Bear         — red
-    6: "#b71c1c",   # Strong Bear  — dark red
+    4: "#ffb300",   # Bear         — amber
+    5: "#ff5252",   # Strong Bear  — red
+    6: "#b71c1c",   # Super Bear   — dark red
 }
 
 # ── Load ──────────────────────────────────────────────────────────────────────

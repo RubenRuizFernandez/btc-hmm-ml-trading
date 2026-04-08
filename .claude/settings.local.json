@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(pip list:*)",
+      "Bash(where python3:*)",
+      "Bash(ls /c/Python3*/python.exe)",
+      "Read(//c/Users/Administrator/AppData/Local/Programs/Python/**)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8501)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8501/_stcore/health)",
+      "Bash(tasklist)",
+      "Bash(/c/Users/Administrator/AppData/Local/Programs/Python/Python313/python.exe -m streamlit run src/dashboard/app.py --server.port 8501 --browser.gatherUsageStats false --server.headless true)"
+    ]
+  }
+}

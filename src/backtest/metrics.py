@@ -39,8 +39,12 @@ def compute_metrics(
     # ── Calmar ────────────────────────────────────────────────────────────────
     n_years = len(equity_curve) / HOURS_PER_YEAR
     total_return = float(equity_curve.iloc[-1] / equity_curve.iloc[0] - 1)
-    annualized_return = (1 + total_return) ** (1 / max(n_years, 1e-6)) - 1
-    calmar = annualized_return / (abs(max_drawdown) + 1e-12)
+    # Guard against negative base for fractional exponent (complex result)
+    if total_return > -1:
+        annualized_return = (1 + total_return) ** (1 / max(n_years, 1e-6)) - 1
+    else:
+        annualized_return = -1.0
+    calmar = float(np.real(annualized_return)) / (abs(max_drawdown) + 1e-12)
 
     # ── Trade-level ───────────────────────────────────────────────────────────
     if trades is not None and len(trades) > 0:
