@@ -1,6 +1,4 @@
 # Data — large files, never commit raw/processed data
-data/raw/
-data/processed/
 
 # Python
 __pycache__/
