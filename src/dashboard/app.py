@@ -1,118 +1,499 @@
-"""Streamlit dashboard — Functional BTC Regime Trading Strategy.
-
-Run with:
-    streamlit run src/dashboard/app.py
-or:
-    python scripts/run_dashboard.py
-"""
+"""Streamlit dashboard for the functional BTC regime trading app."""
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.graph_objects as go
+import streamlit as st
 from plotly.subplots import make_subplots
 
-from src.config import REGIME_LABELS, REGIME_MULTIPLIER, TREND_SCORE_THRESHOLDS, MIN_REGIME_BARS
+from src.backtest.functional import (
+    DEFAULT_REGIME_UNITS,
+    FunctionalTradeConfig,
+    run_functional_strategy,
+)
+from src.backtest.metrics import compute_metrics, monthly_returns
+from src.config import (
+    APP_ACCOUNT_SIZE,
+    APP_MAX_BUYING_POWER_PCT,
+    APP_RISK_PER_TRADE_PCT,
+    MIN_REGIME_BARS,
+    REGIME_LABELS,
+)
 from src.dashboard.plots import (
-    REGIME_COLORS, REGIME_COLORS_RGBA, monthly_returns_heatmap,
-    regime_distribution_chart, regime_transition_heatmap, regime_duration_violin,
+    REGIME_COLORS,
+    btc_regime_price_chart,
+    equity_comparison_chart,
+    exit_reason_chart,
+    monthly_returns_heatmap,
+    regime_distribution_chart,
+    regime_duration_violin,
+    regime_transition_heatmap,
+    trade_pnl_chart,
 )
 from src.data.loader import load_raw
-from src.regime.trend_regime import compute_trend_score, score_to_regime, smooth_regimes
 from src.regime.regime_labels import compute_regime_stats, compute_transition_matrix
-from src.backtest.functional import run_functional_strategy, DEFAULT_REGIME_UNITS
-from src.backtest.metrics import compute_metrics, monthly_returns
+from src.regime.trend_regime import compute_trend_score, score_to_regime, smooth_regimes
 
-# ─── Page config ──────────────────────────────────────────────────────────────
+
+SWEEP_MIN_BARS = 1
+SWEEP_MAX_BARS = 48
+
+
 st.set_page_config(
     page_title="BTC Regime Trading",
-    page_icon="📊",
+    page_icon="BTC",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.markdown("""
+st.markdown(
+    """
 <style>
-    .main { background-color: #0e1117; }
-    div[data-testid="stMetric"] { background: #161b22; border-radius: 8px; padding: 12px; }
+    .stApp {
+        background:
+            radial-gradient(circle at 0% 0%, rgba(11, 140, 102, 0.22), transparent 26%),
+            radial-gradient(circle at 100% 0%, rgba(242, 177, 52, 0.16), transparent 24%),
+            linear-gradient(180deg, #07111b 0%, #091522 100%);
+        color: #f5f7fa;
+    }
+    .block-container {
+        max-width: 1500px;
+        padding-top: 1.25rem;
+        padding-bottom: 3rem;
+    }
+    div[data-testid="stMetric"] {
+        background: linear-gradient(180deg, rgba(13, 22, 34, 0.95), rgba(10, 17, 27, 0.92));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 18px;
+        padding: 14px 16px;
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.18);
+    }
+    .hero-card {
+        background: linear-gradient(135deg, rgba(13, 22, 34, 0.94), rgba(17, 31, 47, 0.88));
+        border: 1px solid rgba(255, 255, 255, 0.09);
+        border-radius: 24px;
+        padding: 24px 28px;
+        margin-bottom: 1rem;
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.18);
+    }
+    .hero-kicker {
+        color: #f2b134;
+        font-size: 0.84rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        margin-bottom: 0.45rem;
+    }
+    .hero-title {
+        font-size: 2rem;
+        font-weight: 700;
+        line-height: 1.15;
+        color: #f8fafc;
+        margin-bottom: 0.55rem;
+    }
+    .hero-subtitle {
+        color: #9db2c8;
+        font-size: 1rem;
+        line-height: 1.5;
+    }
+    .panel-card {
+        background: linear-gradient(180deg, rgba(13, 22, 34, 0.95), rgba(11, 18, 28, 0.93));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 22px;
+        padding: 20px 22px;
+        box-shadow: 0 22px 48px rgba(0, 0, 0, 0.14);
+    }
+    .panel-title {
+        color: #f8fafc;
+        font-size: 1.02rem;
+        font-weight: 700;
+        margin-bottom: 0.9rem;
+    }
+    .snapshot-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 0.55rem 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    }
+    .snapshot-row:last-child {
+        border-bottom: none;
+        padding-bottom: 0;
+    }
+    .snapshot-label {
+        color: #9db2c8;
+        font-size: 0.94rem;
+    }
+    .snapshot-value {
+        color: #f8fafc;
+        font-size: 0.96rem;
+        font-weight: 700;
+        text-align: right;
+    }
+    .regime-pill {
+        display: inline-block;
+        border-radius: 999px;
+        padding: 0.36rem 0.8rem;
+        font-size: 0.82rem;
+        font-weight: 800;
+        color: #081018;
+        margin-bottom: 0.85rem;
+    }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-
-# ─── Cached data ─────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner="Loading OHLCV data...")
 def get_raw_data():
     return load_raw()
 
+
 @st.cache_data(show_spinner="Computing trend score...")
-def get_trend_score(_df):
-    return compute_trend_score(_df)
-
-@st.cache_data(show_spinner="Computing regimes...")
-def get_regimes(_score, min_bars):
-    regime = score_to_regime(_score)
-    return smooth_regimes(regime, min_bars)
+def get_trend_score(df):
+    return compute_trend_score(df)
 
 
-# ─── Sidebar ─────────────────────────────────────────────────────────────────
-
-with st.sidebar:
-    st.title("⚙ Strategy Controls")
-    st.markdown("---")
-
-    default_start = pd.Timestamp("2023-04-07").date()
-    default_end = pd.Timestamp("2026-04-07").date()
-    date_range = st.date_input("Date range", value=[default_start, default_end])
-
-    st.markdown("---")
-    st.markdown("**Account & Risk**")
-    account_size = st.number_input("Account size ($)", value=100_000, step=10_000)
-    margin_pct = st.slider("Margin / buying power (%)", 10, 80, 40, 5) / 100
-    max_loss_pct = st.slider("Hard stop-loss (% of account)", 1.0, 10.0, 3.0, 0.5) / 100
-    sl_cooldown = st.slider("SL cooldown (hours)", 0, 72, 24, 4)
-
-    min_bars = st.slider("Min regime duration (hours)", 1, 48, MIN_REGIME_BARS, 1)
-
-    st.markdown("---")
-    n_units = 3
-    unit_size = account_size * margin_pct / n_units
-    max_loss_usd = account_size * max_loss_pct
-
-    st.markdown("**Position Sizing**")
-    st.markdown(f"Unit size: **${unit_size:,.0f}**")
-    st.markdown(f"Hard SL: **${max_loss_usd:,.0f}**")
-    for i, label in enumerate(REGIME_LABELS):
-        units = DEFAULT_REGIME_UNITS[i]
-        if units == 0:
-            st.markdown(f'<span style="color:{REGIME_COLORS[i]}">■</span> {label} → **Flat**',
-                        unsafe_allow_html=True)
-        else:
-            direction = "LONG" if units > 0 else "SHORT"
-            notional = abs(units) * unit_size
-            sl_move_pct = max_loss_usd / notional * 100
-            st.markdown(
-                f'<span style="color:{REGIME_COLORS[i]}">■</span> {label} → '
-                f'**{direction} x{abs(units)}** (${notional:,.0f}) · SL {sl_move_pct:.1f}%',
-                unsafe_allow_html=True,
-            )
+@st.cache_data(show_spinner="Computing raw regimes...")
+def get_raw_regime_state(score):
+    return score_to_regime(score)
 
 
-# ─── Load & compute ─────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Smoothing regimes...")
+def get_regimes(raw_regime_state, min_bars):
+    return smooth_regimes(raw_regime_state, min_bars)
+
+
+@st.cache_data(show_spinner="Running trading strategy...")
+def get_strategy_result(market_data, regime_state):
+    return run_functional_strategy(market_data, regime_state, config=FunctionalTradeConfig())
+
+
+@st.cache_data(show_spinner="Sweeping regime duration...")
+def get_duration_sweep(market_data, raw_regime_state, start_ts, end_ts):
+    mask = (market_data.index >= start_ts) & (market_data.index <= end_ts)
+    rows: list[dict] = []
+
+    for min_bars in range(SWEEP_MIN_BARS, SWEEP_MAX_BARS + 1):
+        smoothed = smooth_regimes(raw_regime_state, min_bars)
+        common_idx = smoothed.dropna().index.intersection(market_data.index[mask])
+        if len(common_idx) < 2:
+            continue
+
+        result = run_functional_strategy(
+            market_data.loc[common_idx, ["open", "high", "low", "close"]],
+            smoothed.loc[common_idx],
+            config=FunctionalTradeConfig(),
+        )
+        metrics = result.metrics
+        rows.append(
+            {
+                "min_bars": min_bars,
+                "sharpe": metrics["sharpe"],
+                "total_return_pct": metrics["total_return_pct"],
+                "max_drawdown_pct": metrics["max_drawdown_pct"],
+                "win_rate_pct": metrics["win_rate"] * 100 if not pd.isna(metrics["win_rate"]) else np.nan,
+                "n_trades": metrics["n_trades"],
+                "stagnation_days": metrics["stagnation_days"],
+                "mean_open_hours": metrics["mean_open_hours"],
+                "profit_factor": metrics["profit_factor"],
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def choose_best_duration(sweep_df: pd.DataFrame) -> pd.Series | None:
+    if sweep_df.empty:
+        return None
+
+    valid = sweep_df.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["sharpe", "total_return_pct", "max_drawdown_pct"]
+    )
+    if valid.empty:
+        valid = sweep_df.copy()
+
+    with_trades = valid[valid["n_trades"] > 0]
+    if not with_trades.empty:
+        valid = with_trades
+
+    if valid.empty:
+        return None
+
+    ranked = valid.sort_values(
+        by=["sharpe", "total_return_pct", "max_drawdown_pct", "stagnation_days", "n_trades"],
+        ascending=[False, False, False, True, False],
+    )
+    return ranked.iloc[0]
+
+
+def build_sweep_chart(sweep_df: pd.DataFrame, best_duration: int) -> go.Figure:
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Scatter(
+            x=sweep_df["min_bars"],
+            y=sweep_df["sharpe"],
+            name="Sharpe",
+            mode="lines+markers",
+            line=dict(color="#8ab4ff", width=2.5),
+            marker=dict(size=6),
+            hovertemplate="Duration %{x}h<br>Sharpe %{y:.2f}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=sweep_df["min_bars"],
+            y=sweep_df["total_return_pct"],
+            name="Total return",
+            mode="lines",
+            line=dict(color="#f2b134", width=2, dash="dot"),
+            hovertemplate="Duration %{x}h<br>Return %{y:.1f}%<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.add_vline(
+        x=best_duration,
+        line_dash="dash",
+        line_color="#00c853",
+        annotation_text=f"Best {best_duration}h",
+        annotation_position="top",
+    )
+    fig.update_layout(
+        title="Regime Duration Sweep",
+        height=360,
+        paper_bgcolor="#07111b",
+        plot_bgcolor="#07111b",
+        font=dict(color="#f5f7fa"),
+        margin=dict(l=40, r=40, t=60, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    )
+    fig.update_xaxes(title="Min regime duration (hours)", gridcolor="#203042")
+    fig.update_yaxes(title="Sharpe", gridcolor="#203042", secondary_y=False)
+    fig.update_yaxes(title="Total return (%)", gridcolor="#203042", secondary_y=True)
+    return fig
+
+
+def fmt_currency(value: float | int | None, decimals: int = 0) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"${value:,.{decimals}f}"
+
+
+def fmt_percent(value: float | int | None, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{value:.{decimals}f}%"
+
+
+def fmt_ratio(value: float | int | None, decimals: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{value:.{decimals}f}"
+
+
+def fmt_hours(value: float | int | None, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{value:.{decimals}f} h"
+
+
+def fmt_days(value: float | int | None, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{value:.{decimals}f} d"
+
+
+def build_metrics_table(metrics: dict, buy_hold_metrics: dict) -> pd.DataFrame:
+    rows = [
+        ("Selected regime duration", f"{metrics.get('selected_min_bars', 'N/A')} h", "N/A"),
+        ("Starting capital", fmt_currency(metrics["starting_capital"]), fmt_currency(buy_hold_metrics["starting_capital"])),
+        ("Ending capital", fmt_currency(metrics["ending_capital"]), fmt_currency(buy_hold_metrics["ending_capital"])),
+        ("Net P&L", fmt_currency(metrics["net_pnl"]), fmt_currency(buy_hold_metrics["net_pnl"])),
+        ("Total return", fmt_percent(metrics["total_return_pct"]), fmt_percent(buy_hold_metrics["total_return_pct"])),
+        ("Annualized return", fmt_percent(metrics["annualized_return_pct"]), fmt_percent(buy_hold_metrics["annualized_return_pct"])),
+        ("Sharpe", fmt_ratio(metrics["sharpe"]), fmt_ratio(buy_hold_metrics["sharpe"])),
+        ("Calmar", fmt_ratio(metrics["calmar"]), fmt_ratio(buy_hold_metrics["calmar"])),
+        ("Max drawdown", fmt_percent(metrics["max_drawdown_pct"]), fmt_percent(buy_hold_metrics["max_drawdown_pct"])),
+        ("Stagnation days", fmt_days(metrics["stagnation_days"]), fmt_days(buy_hold_metrics["stagnation_days"])),
+        ("Win rate", fmt_percent(metrics["win_rate"] * 100 if not pd.isna(metrics["win_rate"]) else np.nan), "N/A"),
+        ("Mean win", fmt_currency(metrics["avg_win_pnl"], 0), "N/A"),
+        ("Mean loss", fmt_currency(metrics["avg_loss_pnl"], 0), "N/A"),
+        ("Mean open time", fmt_hours(metrics["mean_open_hours"]), "N/A"),
+        ("Profit factor", fmt_ratio(metrics["profit_factor"]), "N/A"),
+        ("Average trade", fmt_percent(metrics["avg_trade_pct"]), "N/A"),
+        ("Trades", str(metrics["n_trades"]), "1"),
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Strategy", "Buy & Hold"]).set_index("Metric")
+
+
+def build_trade_log_table(trades: pd.DataFrame) -> pd.DataFrame:
+    if len(trades) == 0:
+        return pd.DataFrame()
+
+    holding_hours = (
+        (trades["exit_time"] - trades["entry_time"]).dt.total_seconds() / 3600.0
+    ).round(1)
+
+    display = pd.DataFrame(
+        {
+            "Trade #": trades["trade_no"].astype(int),
+            "Entry": trades["entry_time"].dt.strftime("%Y-%m-%d %H:%M"),
+            "Exit": trades["exit_time"].dt.strftime("%Y-%m-%d %H:%M"),
+            "Side": trades["direction"],
+            "Units": trades["units"].astype(int),
+            "Entry px": trades["entry_price"].map(lambda x: fmt_currency(x, 2)),
+            "Exit px": trades["exit_price"].map(lambda x: fmt_currency(x, 2)),
+            "Stop px": trades["sl_price"].map(lambda x: fmt_currency(x, 2)),
+            "Notional": trades["notional"].map(lambda x: fmt_currency(x, 0)),
+            "Max loss": trades["max_loss"].map(lambda x: fmt_currency(x, 0)),
+            "Net P&L": trades["net_pnl"].map(lambda x: fmt_currency(x, 2)),
+            "R multiple": trades["risk_multiple"].map(lambda x: f"{x:+.2f}R"),
+            "Hold (h)": holding_hours.map(lambda x: f"{x:.1f}"),
+            "Exit reason": trades["exit_reason"],
+            "Account after": trades["account_after"].map(lambda x: fmt_currency(x, 0)),
+        }
+    )
+    return display
+
+
+def stop_distance_pct(units: int, config: FunctionalTradeConfig) -> float:
+    notional = abs(units) * config.unit_notional
+    if notional == 0:
+        return 0.0
+    fee_buffer = 2 * notional * config.fee_rate
+    return max(config.risk_budget - fee_buffer, 0.0) / notional * 100
+
+
+def render_snapshot_card(
+    current_regime_label: str,
+    current_regime_color: str,
+    trades: pd.DataFrame,
+    metrics: dict,
+    result,
+) -> None:
+    stop_count = int((trades["exit_reason"] == "STOP LOSS").sum()) if len(trades) else 0
+    regime_exit_count = int((trades["exit_reason"] == "REGIME CHANGE").sum()) if len(trades) else 0
+    best_trade = trades["net_pnl"].max() if len(trades) else np.nan
+    worst_trade = trades["net_pnl"].min() if len(trades) else np.nan
+    open_position_label = "Open" if result.open_position else "Flat"
+
+    st.markdown(
+        f"""
+<div class="panel-card">
+    <div class="regime-pill" style="background:{current_regime_color};">{current_regime_label}</div>
+    <div class="panel-title">Strategy Snapshot</div>
+    <div class="snapshot-row"><span class="snapshot-label">Portfolio state</span><span class="snapshot-value">{open_position_label}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Chosen duration</span><span class="snapshot-value">{metrics.get('selected_min_bars', 'N/A')} h</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Completed trades</span><span class="snapshot-value">{metrics['n_trades']}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Stop exits</span><span class="snapshot-value">{stop_count}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Regime exits</span><span class="snapshot-value">{regime_exit_count}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Mean open time</span><span class="snapshot-value">{fmt_hours(metrics['mean_open_hours'])}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Stagnation</span><span class="snapshot-value">{fmt_days(metrics['stagnation_days'])}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Best trade</span><span class="snapshot-value">{fmt_currency(best_trade, 0)}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Worst trade</span><span class="snapshot-value">{fmt_currency(worst_trade, 0)}</span></div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+strategy_config = FunctionalTradeConfig()
+account_size = strategy_config.account_size
+max_notional = strategy_config.max_notional
 
 df = get_raw_data()
-trend_score = get_trend_score(df)
-regime_state = get_regimes(trend_score, min_bars)
+data_start = df.index[0].date()
+data_end = df.index[-1].date()
+default_start_ts = max(df.index[0], df.index[-1] - pd.Timedelta(days=365 * 3))
 
-# Filter by date
+with st.sidebar:
+    st.title("Strategy Controls")
+    st.markdown("---")
+    date_range = st.date_input(
+        "Date range",
+        value=[default_start_ts.date(), data_end],
+        min_value=data_start,
+        max_value=data_end,
+    )
+    auto_duration = st.toggle("Use best duration from sweep", value=True)
+    duration_status = st.empty()
+    duration_control = st.empty()
+
+    st.markdown("---")
+    st.markdown("**Locked operating model**")
+    st.markdown(f"Account: **{fmt_currency(APP_ACCOUNT_SIZE, 0)}**")
+    st.markdown(
+        f"Static buying power: **{APP_MAX_BUYING_POWER_PCT:.0%}** "
+        f"(**{fmt_currency(max_notional, 0)}** max notional)"
+    )
+    st.markdown(
+        f"Risk per trade: **{APP_RISK_PER_TRADE_PCT:.1%}** "
+        f"(**{fmt_currency(strategy_config.risk_budget, 0)}** max loss)"
+    )
+    st.caption("Trades exit at the hard stop or on regime change, whichever comes first.")
+
+    st.markdown("---")
+    st.markdown("**Regime sizing**")
+    st.markdown(f"Unit notional: **{fmt_currency(strategy_config.unit_notional, 0)}**")
+    for idx, label in enumerate(REGIME_LABELS):
+        units = DEFAULT_REGIME_UNITS[idx]
+        if units == 0:
+            st.markdown(
+                f'<span style="color:{REGIME_COLORS[idx]}">&#9632;</span> {label}: **Flat**',
+                unsafe_allow_html=True,
+            )
+            continue
+        direction = "LONG" if units > 0 else "SHORT"
+        notional = abs(units) * strategy_config.unit_notional
+        st.markdown(
+            f'<span style="color:{REGIME_COLORS[idx]}">&#9632;</span> {label}: '
+            f'**{direction} x{abs(units)}** ({fmt_currency(notional, 0)}) | '
+            f'SL distance {stop_distance_pct(units, strategy_config):.1f}%',
+            unsafe_allow_html=True,
+        )
+
+trend_score = get_trend_score(df)
+raw_regime_state = get_raw_regime_state(trend_score)
+
 if len(date_range) == 2:
     start_ts = pd.Timestamp(date_range[0], tz="UTC")
     end_ts = pd.Timestamp(date_range[1], tz="UTC")
 else:
-    start_ts, end_ts = df.index[0], df.index[-1]
+    start_ts = pd.Timestamp(data_start, tz="UTC")
+    end_ts = pd.Timestamp(data_end, tz="UTC")
+
+sweep_df = get_duration_sweep(df[["open", "high", "low", "close"]], raw_regime_state, start_ts, end_ts)
+best_duration_row = choose_best_duration(sweep_df)
+
+if auto_duration and best_duration_row is not None:
+    selected_min_bars = int(best_duration_row["min_bars"])
+    duration_status.markdown(
+        f"**Selected duration:** `{selected_min_bars}h` from Sharpe sweep"
+    )
+    with duration_control.container():
+        st.caption("Manual duration appears only when auto sweep is disabled.")
+else:
+    with duration_control.container():
+        manual_min_bars = st.slider(
+            "Manual regime duration (hours)",
+            SWEEP_MIN_BARS,
+            SWEEP_MAX_BARS,
+            MIN_REGIME_BARS,
+            1,
+            key="manual_min_bars",
+        )
+    selected_min_bars = manual_min_bars
+    duration_status.markdown(
+        f"**Selected duration:** `{selected_min_bars}h` manual"
+    )
+
+regime_state = get_regimes(raw_regime_state, selected_min_bars)
 
 mask = (df.index >= start_ts) & (df.index <= end_ts)
 common_idx = regime_state.dropna().index.intersection(df.index[mask])
@@ -124,324 +505,243 @@ if len(df_view) < 2:
     st.error("No data in selected date range.")
     st.stop()
 
-# ─── Run functional strategy ────────────────────────────────────────────────
+result = get_strategy_result(df_view[["open", "high", "low", "close"]], rs_view)
+metrics = result.metrics
+metrics["selected_min_bars"] = selected_min_bars
+trades = result.trades.copy()
 
-result = run_functional_strategy(
-    df_view["close"], rs_view,
-    account_size=account_size,
-    margin_pct=margin_pct,
-    max_loss_pct=max_loss_pct,
-    sl_cooldown_bars=sl_cooldown,
-)
-m = result.metrics
-
-# B&H: invest the same max notional ($40K) in BTC
-bh_notional = account_size * margin_pct
 bh_return = df_view["close"].iloc[-1] / df_view["close"].iloc[0] - 1
-bh_pnl = bh_notional * bh_return
-bh_equity = account_size + bh_notional * (df_view["close"] / df_view["close"].iloc[0] - 1)
-bh_m = compute_metrics(bh_equity / bh_equity.iloc[0])
-bh_m["net_pnl"] = float(bh_pnl)
-bh_m["starting_capital"] = float(account_size)
-bh_m["ending_capital"] = float(account_size + bh_pnl)
+bh_pnl = max_notional * bh_return
+bh_equity = account_size + max_notional * (df_view["close"] / df_view["close"].iloc[0] - 1)
+bh_metrics = compute_metrics(bh_equity / account_size)
+bh_metrics["net_pnl"] = float(bh_pnl)
+bh_metrics["starting_capital"] = float(account_size)
+bh_metrics["ending_capital"] = float(account_size + bh_pnl)
 
-# ─── Header ─────────────────────────────────────────────────────────────────
+current_regime = int(rs_view.iloc[-1])
+current_regime_label = REGIME_LABELS[current_regime]
+current_regime_color = REGIME_COLORS[current_regime]
+monthly_tbl = monthly_returns(result.equity_curve / account_size)
+metrics_table = build_metrics_table(metrics, bh_metrics)
+trade_log_table = build_trade_log_table(trades.iloc[::-1]) if len(trades) else pd.DataFrame()
 
-st.title("📊 BTC/USD — Functional Regime Trading")
-st.caption(
-    f"Showing: {df_view.index[0].date()} → {df_view.index[-1].date()} · "
-    f"{len(df_view):,} bars · Account ${account_size:,.0f} · "
-    f"Margin {margin_pct:.0%} · SL {max_loss_pct:.0%}"
-)
-
-# ─── Top metrics ─────────────────────────────────────────────────────────────
-
-st.markdown("### Strategy vs Buy & Hold")
-
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Net P&L", f"${m['net_pnl']:+,.0f}",
-          delta=f"${m['net_pnl'] - bh_m['net_pnl']:+,.0f} vs B&H", delta_color="normal")
-c2.metric("Account Value", f"${result.equity_curve.iloc[-1]:,.0f}")
-c3.metric("Total Return", f"{m['total_return_pct']:.1f}%",
-          delta=f"{m['total_return_pct'] - bh_m['total_return_pct']:+.1f}%", delta_color="normal")
-c4.metric("Sharpe", f"{m['sharpe']:.2f}",
-          delta=f"{m['sharpe'] - bh_m['sharpe']:+.2f}", delta_color="normal")
-c5.metric("Max Drawdown", f"{m['max_drawdown_pct']:.1f}%",
-          delta=f"{m['max_drawdown_pct'] - bh_m['max_drawdown_pct']:+.1f}%", delta_color="inverse")
-c6.metric("Trades", f"{m['n_trades']}")
-
-# B&H reference
 st.markdown(
-    f"<div style='background:#1a1a2e; padding:8px 16px; border-radius:6px; margin-bottom:12px; font-size:0.85em;'>"
-    f"<b>Buy & Hold ({margin_pct:.0%} capital):</b> &nbsp; "
-    f"P&L: ${bh_m['net_pnl']:+,.0f} &nbsp;|&nbsp; "
-    f"Return: {bh_m['total_return_pct']:.1f}% &nbsp;|&nbsp; "
-    f"Sharpe: {bh_m['sharpe']:.2f} &nbsp;|&nbsp; "
-    f"Max DD: {bh_m['max_drawdown_pct']:.1f}%"
-    f"</div>",
+    f"""
+<div class="hero-card">
+    <div class="hero-kicker">Functional Trading App</div>
+    <div class="hero-title">Sweep-driven regime selection, strategy diagnostics, and BTC trade context.</div>
+    <div class="hero-subtitle">
+        Showing {df_view.index[0].date()} to {df_view.index[-1].date()} |
+        {len(df_view):,} hourly bars |
+        {len(trades)} completed trades |
+        Best regime duration {selected_min_bars}h |
+        Static buying power {APP_MAX_BUYING_POWER_PCT:.0%} |
+        Risk per trade {APP_RISK_PER_TRADE_PCT:.1%}
+    </div>
+</div>
+""",
     unsafe_allow_html=True,
 )
 
-# Open position banner
 if result.open_position:
     op = result.open_position
-    pnl_color = "#00c853" if op["unrealized_pnl"] >= 0 else "#ef5350"
+    pnl_color = "#00c853" if op["unrealized_pnl"] >= 0 else "#ff6b57"
     st.markdown(
-        f"<div style='background:#1b2838; padding:10px 16px; border-radius:6px; "
-        f"border-left:4px solid {pnl_color}; margin-bottom:12px;'>"
-        f"<b>Open Position:</b> {op['direction']} x{op['units']} · "
-        f"Entry: ${op['entry_price']:,.2f} · SL: ${op['sl_price']:,.2f} · "
-        f"Current: ${op['current_price']:,.2f} · "
-        f"P&L: <span style='color:{pnl_color}'>${op['unrealized_pnl']:+,.2f}</span>"
-        f"</div>",
+        f"""
+<div class="panel-card" style="margin-bottom: 1rem; border-left: 4px solid {pnl_color};">
+    <div class="panel-title">Open Position</div>
+    <div class="snapshot-row"><span class="snapshot-label">Direction</span><span class="snapshot-value">{op['direction']} x{op['units']}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Entry</span><span class="snapshot-value">{fmt_currency(op['entry_price'], 2)}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Current</span><span class="snapshot-value">{fmt_currency(op['current_price'], 2)}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Stop</span><span class="snapshot-value">{fmt_currency(op['sl_price'], 2)}</span></div>
+    <div class="snapshot-row"><span class="snapshot-label">Unrealized P&L</span><span class="snapshot-value" style="color:{pnl_color};">{fmt_currency(op['unrealized_pnl'], 2)}</span></div>
+</div>
+""",
         unsafe_allow_html=True,
     )
 
-st.markdown("---")
+kpi_row_1 = st.columns(4)
+kpi_row_2 = st.columns(4)
+kpi_row_3 = st.columns(4)
+kpi_row_1[0].metric("Account value", fmt_currency(result.equity_curve.iloc[-1], 0))
+kpi_row_1[1].metric(
+    "Net P&L",
+    fmt_currency(metrics["net_pnl"], 0),
+    delta=f"{fmt_currency(metrics['net_pnl'] - bh_metrics['net_pnl'], 0)} vs B&H",
+    delta_color="normal",
+)
+kpi_row_1[2].metric(
+    "Total return",
+    fmt_percent(metrics["total_return_pct"]),
+    delta=f"{metrics['total_return_pct'] - bh_metrics['total_return_pct']:+.1f}%",
+    delta_color="normal",
+)
+kpi_row_1[3].metric("Chosen duration", f"{selected_min_bars} h")
 
-# ─── Tabs ────────────────────────────────────────────────────────────────────
+kpi_row_2[0].metric("Sharpe", fmt_ratio(metrics["sharpe"]))
+kpi_row_2[1].metric(
+    "Win rate",
+    fmt_percent(metrics["win_rate"] * 100 if not pd.isna(metrics["win_rate"]) else np.nan),
+)
+kpi_row_2[2].metric("Max drawdown", fmt_percent(metrics["max_drawdown_pct"]))
+kpi_row_2[3].metric("Trades", str(metrics["n_trades"]))
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["🕯 Price & Regime", "📈 Equity & P&L", "📋 Trade Log", "🔍 Regime Analysis"]
+kpi_row_3[0].metric("Stagnation days", fmt_days(metrics["stagnation_days"]))
+kpi_row_3[1].metric("Mean win", fmt_currency(metrics["avg_win_pnl"], 0))
+kpi_row_3[2].metric("Mean loss", fmt_currency(metrics["avg_loss_pnl"], 0))
+kpi_row_3[3].metric("Mean open time", fmt_hours(metrics["mean_open_hours"]))
+
+overview_left, overview_right = st.columns([1.85, 1], gap="large")
+with overview_left:
+    st.markdown("### Equity Evolution")
+    st.plotly_chart(
+        equity_comparison_chart(result.equity_curve, bh_equity),
+        use_container_width=True,
+    )
+
+with overview_right:
+    st.markdown("### Strategy Snapshot")
+    render_snapshot_card(current_regime_label, current_regime_color, trades, metrics, result)
+    if len(trades) > 0:
+        st.plotly_chart(exit_reason_chart(trades), use_container_width=True)
+
+if best_duration_row is not None and not sweep_df.empty:
+    sweep_left, sweep_right = st.columns([1.55, 1], gap="large")
+    with sweep_left:
+        st.markdown("### Regime Duration Sweep")
+        st.plotly_chart(
+            build_sweep_chart(sweep_df, selected_min_bars),
+            use_container_width=True,
+        )
+    with sweep_right:
+        st.markdown("### Best Sweep Result")
+        best_stats = pd.DataFrame(
+            {
+                "Metric": [
+                    "Best duration",
+                    "Sharpe",
+                    "Total return",
+                    "Max drawdown",
+                    "Win rate",
+                    "Trades",
+                    "Stagnation",
+                    "Mean open time",
+                ],
+                "Value": [
+                    f"{int(best_duration_row['min_bars'])} h",
+                    fmt_ratio(best_duration_row["sharpe"]),
+                    fmt_percent(best_duration_row["total_return_pct"]),
+                    fmt_percent(best_duration_row["max_drawdown_pct"]),
+                    fmt_percent(best_duration_row["win_rate_pct"]),
+                    str(int(best_duration_row["n_trades"])),
+                    fmt_days(best_duration_row["stagnation_days"]),
+                    fmt_hours(best_duration_row["mean_open_hours"]),
+                ],
+            }
+        ).set_index("Metric")
+        st.dataframe(best_stats, use_container_width=True)
+
+        with st.expander("Sweep table"):
+            sweep_table = sweep_df.copy().sort_values("sharpe", ascending=False)
+            sweep_table["sharpe"] = sweep_table["sharpe"].map(lambda x: fmt_ratio(x))
+            sweep_table["total_return_pct"] = sweep_table["total_return_pct"].map(lambda x: fmt_percent(x))
+            sweep_table["max_drawdown_pct"] = sweep_table["max_drawdown_pct"].map(lambda x: fmt_percent(x))
+            sweep_table["win_rate_pct"] = sweep_table["win_rate_pct"].map(lambda x: fmt_percent(x))
+            sweep_table["stagnation_days"] = sweep_table["stagnation_days"].map(lambda x: fmt_days(x))
+            sweep_table["mean_open_hours"] = sweep_table["mean_open_hours"].map(lambda x: fmt_hours(x))
+            sweep_table = sweep_table.rename(
+                columns={
+                    "min_bars": "Duration (h)",
+                    "sharpe": "Sharpe",
+                    "total_return_pct": "Return",
+                    "max_drawdown_pct": "Max DD",
+                    "win_rate_pct": "Win rate",
+                    "n_trades": "Trades",
+                    "stagnation_days": "Stagnation",
+                    "mean_open_hours": "Mean open time",
+                    "profit_factor": "Profit factor",
+                }
+            )
+            st.dataframe(sweep_table, use_container_width=True, height=360)
+
+st.markdown("### BTC Price and Trades")
+st.caption("BTC is colored by active regime. Entry and exit markers are rendered directly on the price path.")
+st.plotly_chart(
+    btc_regime_price_chart(df_view, rs_view, trades, max_points=5000),
+    use_container_width=True,
 )
 
-# ── Tab 1: Price & Regime ────────────────────────────────────────────────────
-with tab1:
-    max_candles = 2000
-    idx = df_view.index
-    if len(idx) > max_candles:
-        step = len(idx) // max_candles
-        idx = idx[::step]
+detail_left, detail_right = st.columns([1.45, 1], gap="large")
+with detail_left:
+    st.markdown("### Trade P&L Evolution")
+    if len(trades) > 0:
+        st.plotly_chart(trade_pnl_chart(trades), use_container_width=True)
+    else:
+        st.info("No trades in the selected period.")
 
-    df_plot = df_view.loc[idx]
-    reg_plot = rs_view.reindex(idx, method="ffill")
+with detail_right:
+    st.markdown("### Monthly Return Map")
+    st.plotly_chart(monthly_returns_heatmap(monthly_tbl), use_container_width=True)
 
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        vertical_spacing=0.04, row_heights=[0.75, 0.25],
-        subplot_titles=["BTC/USD + Regime Bands", "Trend Score"],
-    )
+st.markdown("### Strategy Statistics")
+st.dataframe(metrics_table, use_container_width=True)
 
-    # Candlestick
-    fig.add_trace(go.Candlestick(
-        x=df_plot.index, open=df_plot["open"], high=df_plot["high"],
-        low=df_plot["low"], close=df_plot["close"],
-        name="BTC/USD", increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-        showlegend=False,
-    ), row=1, col=1)
+tab_trades, tab_regimes = st.tabs(["Trade Log", "Regime Analysis"])
 
-    # Regime bands
-    prev_state, seg_start = None, idx[0]
-    for i, ts in enumerate(idx):
-        state = reg_plot.iloc[i]
-        if pd.isna(state):
-            continue
-        if state != prev_state or i == len(idx) - 1:
-            if prev_state is not None and not pd.isna(prev_state):
-                fig.add_vrect(x0=seg_start, x1=ts,
-                              fillcolor=REGIME_COLORS_RGBA[int(prev_state)],
-                              layer="below", line_width=0, row=1, col=1)
-            seg_start = ts
-            prev_state = state
-
-    # Trade markers
-    if len(result.trades) > 0:
-        for _, t in result.trades.iterrows():
-            color = "#00c853" if t["direction"] == "LONG" else "#c62828"
-            # Entry
-            fig.add_trace(go.Scatter(
-                x=[t["entry_time"]], y=[t["entry_price"]],
-                mode="markers", marker=dict(
-                    symbol="triangle-up" if t["direction"] == "LONG" else "triangle-down",
-                    size=10, color=color,
-                ),
-                name=f"Entry {t['direction']}", showlegend=False,
-                hovertemplate=f"{t['direction']} x{t['units']}<br>Entry ${t['entry_price']:,.0f}<br>SL ${t['sl_price']:,.0f}",
-            ), row=1, col=1)
-            # Exit
-            exit_color = "#ff7043" if t["exit_reason"] == "STOP LOSS" else "#9e9e9e"
-            fig.add_trace(go.Scatter(
-                x=[t["exit_time"]], y=[t["exit_price"]],
-                mode="markers", marker=dict(symbol="x", size=8, color=exit_color),
-                name=f"Exit ({t['exit_reason']})", showlegend=False,
-                hovertemplate=f"Exit: {t['exit_reason']}<br>${t['exit_price']:,.0f}<br>P&L ${t['net_pnl']:+,.0f}",
-            ), row=1, col=1)
-
-    # Trend score
-    score_plot = score_view.reindex(idx, method="ffill")
-    fig.add_trace(go.Scatter(
-        x=score_plot.index, y=score_plot.values,
-        mode="lines", name="Trend Score",
-        line=dict(color="#42a5f5", width=1.5),
-    ), row=2, col=1)
-    fig.add_hline(y=0, line_dash="solid", line_color="#555", row=2, col=1)
-    for t in TREND_SCORE_THRESHOLDS:
-        fig.add_hline(y=t, line_dash="dot", line_color="#333", row=2, col=1)
-
-    fig.update_layout(
-        height=700, paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-        font=dict(color="#fafafa"), xaxis_rangeslider_visible=False,
-        margin=dict(l=40, r=20, t=40, b=20),
-    )
-    fig.update_yaxes(gridcolor="#1e2128")
-    fig.update_xaxes(gridcolor="#1e2128")
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.plotly_chart(regime_distribution_chart(rs_view), use_container_width=True)
-
-
-# ── Tab 2: Equity & P&L ─────────────────────────────────────────────────────
-with tab2:
-    fig_eq = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        vertical_spacing=0.05, row_heights=[0.7, 0.3],
-        subplot_titles=["Account Value ($)", "Drawdown (%)"],
-    )
-    fig_eq.add_trace(go.Scatter(
-        x=result.equity_curve.index, y=result.equity_curve.values,
-        name="Strategy", line=dict(color="#42a5f5", width=2.5),
-    ), row=1, col=1)
-    fig_eq.add_trace(go.Scatter(
-        x=bh_equity.index, y=bh_equity.values,
-        name=f"B&H ({margin_pct:.0%} capital)", line=dict(color="#9e9e9e", width=2, dash="dot"),
-    ), row=1, col=1)
-    fig_eq.add_hline(y=account_size, line_dash="dash", line_color="#555",
-                     annotation_text="Starting capital", row=1, col=1)
-
-    # Drawdown
-    rm = result.equity_curve.cummax()
-    dd = (result.equity_curve - rm) / rm * 100
-    fig_eq.add_trace(go.Scatter(
-        x=dd.index, y=dd.values, name="Drawdown %", fill="tozeroy",
-        line=dict(color="#ef5350", width=1), fillcolor="rgba(239,83,80,0.15)",
-    ), row=2, col=1)
-
-    fig_eq.update_layout(
-        height=550, paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-        font=dict(color="#fafafa"), margin=dict(l=60, r=20, t=40, b=20),
-    )
-    fig_eq.update_yaxes(gridcolor="#1e2128", tickformat="$,.0f", row=1, col=1)
-    fig_eq.update_yaxes(gridcolor="#1e2128", row=2, col=1)
-    st.plotly_chart(fig_eq, use_container_width=True)
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        monthly_tbl = monthly_returns(result.equity_curve / result.equity_curve.iloc[0])
-        st.plotly_chart(monthly_returns_heatmap(monthly_tbl), use_container_width=True)
-    with col_b:
-        if len(result.trades) > 0:
-            # Trade P&L bar chart
-            fig_pnl = go.Figure(go.Bar(
-                x=result.trades["trade_no"],
-                y=result.trades["net_pnl"],
-                marker_color=["#00c853" if p > 0 else "#ef5350" for p in result.trades["net_pnl"]],
-                hovertemplate="Trade #%{x}<br>P&L: $%{y:+,.0f}<extra></extra>",
-            ))
-            fig_pnl.add_hline(y=0, line_dash="dash", line_color="#555")
-            fig_pnl.update_layout(
-                title="Trade P&L ($)", height=400,
-                paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-                font=dict(color="#fafafa"), xaxis_title="Trade #", yaxis_title="P&L ($)",
-                yaxis_tickformat="$,.0f",
-            )
-            st.plotly_chart(fig_pnl, use_container_width=True)
-
-    # Metrics comparison table
-    st.subheader("Detailed Metrics")
-    def _f(v, fmt=".1f"):
-        return f"{v:{fmt}}" if isinstance(v, (int, float)) and not np.isnan(v) else "N/A"
-
-    metrics_rows = {
-        "Metric": ["Starting Capital", "Ending Capital", "Net P&L",
-                    "Total Return (%)", "Annualized Return (%)",
-                    "Sharpe", "Calmar", "Max Drawdown (%)",
-                    "Win Rate", "Profit Factor", "# Trades"],
-        "Strategy": [
-            f"${m['starting_capital']:,.0f}", f"${m['ending_capital']:,.0f}", f"${m['net_pnl']:+,.0f}",
-            _f(m["total_return_pct"]), _f(m["annualized_return_pct"]),
-            _f(m["sharpe"], ".2f"), _f(m["calmar"], ".2f"), _f(m["max_drawdown_pct"]),
-            _f(m["win_rate"], ".1%") if not np.isnan(m.get("win_rate", float("nan"))) else "N/A",
-            _f(m["profit_factor"], ".2f") if not np.isnan(m.get("profit_factor", float("nan"))) else "N/A",
-            str(m["n_trades"]),
-        ],
-        "Buy & Hold": [
-            f"${bh_m['starting_capital']:,.0f}", f"${bh_m['ending_capital']:,.0f}", f"${bh_m['net_pnl']:+,.0f}",
-            _f(bh_m["total_return_pct"]), _f(bh_m["annualized_return_pct"]),
-            _f(bh_m["sharpe"], ".2f"), _f(bh_m["calmar"], ".2f"), _f(bh_m["max_drawdown_pct"]),
-            "N/A", "N/A", "1",
-        ],
-    }
-    st.dataframe(pd.DataFrame(metrics_rows).set_index("Metric"), use_container_width=True)
-
-
-# ── Tab 3: Trade Log ─────────────────────────────────────────────────────────
-with tab3:
-    if len(result.trades) > 0:
-        # Summary stats
-        trades = result.trades
-        sl_trades = trades[trades["exit_reason"] == "STOP LOSS"]
-        regime_trades = trades[trades["exit_reason"] == "REGIME CHANGE"]
+with tab_trades:
+    if len(trades) > 0:
+        summary_cols = st.columns(5)
         winners = trades[trades["net_pnl"] > 0]
         losers = trades[trades["net_pnl"] <= 0]
+        summary_cols[0].metric("Winning trades", str(len(winners)))
+        summary_cols[1].metric("Losing trades", str(len(losers)))
+        summary_cols[2].metric("Stop losses", str((trades["exit_reason"] == "STOP LOSS").sum()))
+        summary_cols[3].metric("Best trade", fmt_currency(trades["net_pnl"].max(), 0))
+        summary_cols[4].metric("Worst trade", fmt_currency(trades["net_pnl"].min(), 0))
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Trades", len(trades))
-        c2.metric("Winners", f"{len(winners)} ({len(winners)/len(trades)*100:.0f}%)")
-        c3.metric("Stop Losses", f"{len(sl_trades)}")
-        c4.metric("Avg Win", f"${winners['net_pnl'].mean():+,.0f}" if len(winners) else "N/A")
-        c5.metric("Avg Loss", f"${losers['net_pnl'].mean():+,.0f}" if len(losers) else "N/A")
+        st.markdown("#### Recent Trades")
+        st.dataframe(trade_log_table.head(20), use_container_width=True, height=420)
 
-        # Full trade log
-        st.subheader("Trade Log")
-        display_cols = [
-            "trade_no", "entry_time", "exit_time", "direction", "units",
-            "entry_price", "exit_price", "sl_price", "notional",
-            "net_pnl", "exit_reason", "account_after",
-        ]
-        st.dataframe(
-            trades[display_cols].style.applymap(
-                lambda v: "color: #00c853" if isinstance(v, (int, float)) and v > 0
-                else "color: #ef5350" if isinstance(v, (int, float)) and v < 0
-                else "",
-                subset=["net_pnl"],
-            ).format({
-                "entry_price": "${:,.2f}",
-                "exit_price": "${:,.2f}",
-                "sl_price": "${:,.2f}",
-                "notional": "${:,.0f}",
-                "net_pnl": "${:+,.2f}",
-                "account_after": "${:,.0f}",
-            }),
-            use_container_width=True,
-            height=600,
-        )
+        st.markdown("#### Full Trade Log")
+        st.dataframe(trade_log_table, use_container_width=True, height=620)
     else:
-        st.info("No trades in selected period.")
+        st.info("No trades in the selected period.")
 
-
-# ── Tab 4: Regime Analysis ───────────────────────────────────────────────────
-with tab4:
-    col_a, col_b = st.columns(2)
-    with col_a:
+with tab_regimes:
+    regime_col_1, regime_col_2 = st.columns(2)
+    with regime_col_1:
+        st.plotly_chart(regime_distribution_chart(rs_view), use_container_width=True)
         trans_mat = compute_transition_matrix(rs_view)
         st.plotly_chart(regime_transition_heatmap(trans_mat), use_container_width=True)
-    with col_b:
+    with regime_col_2:
         feat_df_dur = pd.DataFrame({"regime_state": rs_view})
         st.plotly_chart(regime_duration_violin(feat_df_dur), use_container_width=True)
 
-    st.subheader("Regime Statistics")
-    feat_df = pd.DataFrame({
-        "regime_state": rs_view,
-        "regime_confidence": (score_view.abs() / 7.0).clip(0, 1),
-        "forward_return": np.log(df_view["close"].shift(-8) / df_view["close"]),
-    })
-    stats = compute_regime_stats(feat_df)
-    st.dataframe(
-        stats[["regime_label", "count", "directional_accuracy",
-               "mean_confidence", "mean_duration_bars"]].style.format({
-            "directional_accuracy": "{:.1%}",
-            "mean_confidence": "{:.1%}",
-            "mean_duration_bars": "{:.1f}",
-        }),
-        use_container_width=True,
-    )
+        feat_df = pd.DataFrame(
+            {
+                "regime_state": rs_view,
+                "regime_confidence": (score_view.abs() / 7.0).clip(0, 1),
+                "forward_return": np.log(df_view["close"].shift(-8) / df_view["close"]),
+            }
+        )
+        stats = compute_regime_stats(feat_df)
+        regime_stats_table = stats[
+            [
+                "regime_label",
+                "count",
+                "directional_accuracy",
+                "mean_confidence",
+                "mean_duration_bars",
+            ]
+        ].copy()
+        regime_stats_table["directional_accuracy"] = regime_stats_table["directional_accuracy"].map(
+            lambda x: f"{x:.1%}"
+        )
+        regime_stats_table["mean_confidence"] = regime_stats_table["mean_confidence"].map(
+            lambda x: f"{x:.1%}"
+        )
+        regime_stats_table["mean_duration_bars"] = regime_stats_table["mean_duration_bars"].map(
+            lambda x: f"{x:.1f}"
+        )
+        st.markdown("#### Regime Statistics")
+        st.dataframe(regime_stats_table, use_container_width=True, height=320)

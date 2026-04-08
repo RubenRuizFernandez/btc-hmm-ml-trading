@@ -132,6 +132,12 @@ SLIPPAGE_BPS = 5                    # 5 bps adverse move on fill
 KELLY_FRACTION = 0.25               # quarter-Kelly
 MAX_POSITION = 1.5                  # max fraction of capital per trade (allows modest leverage)
 
+# Functional app defaults
+APP_ACCOUNT_SIZE = 200_000
+APP_MAX_BUYING_POWER_PCT = 0.35
+APP_RISK_PER_TRADE_PCT = 0.015
+LIVE_RISK_PER_TRADE_PCT = 0.014
+
 # ─── Risk-free rate (annualized) ──────────────────────────────────────────────
 RISK_FREE_RATE = 0.04
 HOURS_PER_YEAR = 8_760

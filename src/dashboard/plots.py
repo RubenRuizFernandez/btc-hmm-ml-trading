@@ -23,6 +23,253 @@ REGIME_COLORS_RGBA = [
 ]
 
 
+def _sample_frame(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
+    if len(df) <= max_points:
+        return df
+
+    step = max(len(df) // max_points, 1)
+    sampled = df.iloc[::step]
+    if sampled.index[-1] != df.index[-1]:
+        sampled = pd.concat([sampled, df.iloc[[-1]]])
+    return sampled
+
+
+def btc_regime_price_chart(
+    df: pd.DataFrame,
+    regime_state: pd.Series,
+    trades: pd.DataFrame | None = None,
+    max_points: int = 5000,
+) -> go.Figure:
+    """Color-coded BTC close chart with visible trade markers."""
+    plot_df = pd.DataFrame(
+        {
+            "close": df["close"].astype(float),
+            "regime_state": regime_state.reindex(df.index).ffill().bfill().astype(int),
+        },
+        index=df.index,
+    )
+    plot_df = _sample_frame(plot_df, max_points)
+
+    fig = go.Figure()
+    seen_states: set[int] = set()
+    run_start = 0
+
+    for idx in range(1, len(plot_df) + 1):
+        is_boundary = idx == len(plot_df) or (
+            plot_df["regime_state"].iat[idx] != plot_df["regime_state"].iat[idx - 1]
+        )
+        if not is_boundary:
+            continue
+
+        segment = plot_df.iloc[run_start:idx]
+        state = int(segment["regime_state"].iat[0])
+        fig.add_vrect(
+            x0=segment.index[0],
+            x1=segment.index[-1],
+            fillcolor=REGIME_COLORS_RGBA[state],
+            layer="below",
+            line_width=0,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=segment.index,
+                y=segment["close"],
+                mode="lines",
+                name=REGIME_LABELS[state],
+                legendgroup=REGIME_LABELS[state],
+                showlegend=state not in seen_states,
+                line=dict(color=REGIME_COLORS[state], width=3),
+                hovertemplate=(
+                    f"{REGIME_LABELS[state]}<br>"
+                    "Time: %{x}<br>"
+                    "BTC: $%{y:,.0f}<extra></extra>"
+                ),
+            )
+        )
+        seen_states.add(state)
+        run_start = idx
+
+    if trades is not None and len(trades) > 0:
+        long_entries = trades[trades["direction"] == "LONG"]
+        short_entries = trades[trades["direction"] == "SHORT"]
+        stop_exits = trades[trades["exit_reason"] == "STOP LOSS"]
+        regime_exits = trades[trades["exit_reason"] == "REGIME CHANGE"]
+
+        if len(long_entries) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=long_entries["entry_time"],
+                    y=long_entries["entry_price"],
+                    mode="markers",
+                    name="Long entry",
+                    marker=dict(
+                        symbol="triangle-up",
+                        size=15,
+                        color="#f8fafc",
+                        line=dict(color="#00c853", width=2),
+                    ),
+                    hovertemplate=(
+                        "Long entry<br>"
+                        "Time: %{x}<br>"
+                        "Entry: $%{y:,.2f}<extra></extra>"
+                    ),
+                )
+            )
+
+        if len(short_entries) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=short_entries["entry_time"],
+                    y=short_entries["entry_price"],
+                    mode="markers",
+                    name="Short entry",
+                    marker=dict(
+                        symbol="triangle-down",
+                        size=15,
+                        color="#f8fafc",
+                        line=dict(color="#c62828", width=2),
+                    ),
+                    hovertemplate=(
+                        "Short entry<br>"
+                        "Time: %{x}<br>"
+                        "Entry: $%{y:,.2f}<extra></extra>"
+                    ),
+                )
+            )
+
+        if len(regime_exits) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=regime_exits["exit_time"],
+                    y=regime_exits["exit_price"],
+                    mode="markers",
+                    name="Regime exit",
+                    marker=dict(
+                        symbol="circle",
+                        size=11,
+                        color="#f2b134",
+                        line=dict(color="#111827", width=1),
+                    ),
+                    hovertemplate=(
+                        "Regime exit<br>"
+                        "Time: %{x}<br>"
+                        "Exit: $%{y:,.2f}<extra></extra>"
+                    ),
+                )
+            )
+
+        if len(stop_exits) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=stop_exits["exit_time"],
+                    y=stop_exits["exit_price"],
+                    mode="markers",
+                    name="Stop loss",
+                    marker=dict(
+                        symbol="x",
+                        size=13,
+                        color="#ff6b57",
+                        line=dict(color="#ffe4dd", width=1),
+                    ),
+                    hovertemplate=(
+                        "Stop loss<br>"
+                        "Time: %{x}<br>"
+                        "Exit: $%{y:,.2f}<extra></extra>"
+                    ),
+                )
+            )
+
+    fig.update_layout(
+        title="BTC Price Map by Regime",
+        height=620,
+        paper_bgcolor="#07111b",
+        plot_bgcolor="#07111b",
+        font=dict(color="#f5f7fa"),
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            bgcolor="rgba(7,17,27,0.0)",
+        ),
+        margin=dict(l=40, r=20, t=70, b=20),
+    )
+    fig.update_yaxes(gridcolor="#203042", tickprefix="$", separatethousands=True)
+    fig.update_xaxes(gridcolor="#203042")
+    return fig
+
+
+def trade_pnl_chart(trades: pd.DataFrame) -> go.Figure:
+    """Trade-by-trade PnL with cumulative line."""
+    cumulative = trades["net_pnl"].cumsum()
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Bar(
+            x=trades["trade_no"],
+            y=trades["net_pnl"],
+            name="Trade P&L",
+            marker_color=["#00c853" if pnl > 0 else "#ff6b57" for pnl in trades["net_pnl"]],
+            hovertemplate="Trade #%{x}<br>P&L: $%{y:+,.0f}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=trades["trade_no"],
+            y=cumulative,
+            name="Cumulative P&L",
+            mode="lines+markers",
+            line=dict(color="#8ab4ff", width=2.5),
+            marker=dict(size=6),
+            hovertemplate="After trade %{x}<br>Cumulative: $%{y:+,.0f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="#5c6b7a")
+    fig.update_layout(
+        title="Trade P&L Evolution",
+        height=420,
+        paper_bgcolor="#07111b",
+        plot_bgcolor="#07111b",
+        font=dict(color="#f5f7fa"),
+        margin=dict(l=40, r=40, t=60, b=20),
+    )
+    fig.update_yaxes(gridcolor="#203042", tickprefix="$", separatethousands=True, secondary_y=False)
+    fig.update_yaxes(gridcolor="#203042", tickprefix="$", separatethousands=True, secondary_y=True)
+    fig.update_xaxes(gridcolor="#203042", title="Trade #")
+    return fig
+
+
+def exit_reason_chart(trades: pd.DataFrame) -> go.Figure:
+    """Donut chart of trade exits."""
+    counts = trades["exit_reason"].value_counts()
+    color_map = {
+        "REGIME CHANGE": "#f2b134",
+        "STOP LOSS": "#ff6b57",
+    }
+    fig = go.Figure(
+        go.Pie(
+            labels=counts.index.tolist(),
+            values=counts.values,
+            hole=0.62,
+            marker=dict(colors=[color_map.get(label, "#8ab4ff") for label in counts.index]),
+            textinfo="label+percent",
+        )
+    )
+    fig.update_layout(
+        title="Exit Breakdown",
+        height=320,
+        paper_bgcolor="#07111b",
+        plot_bgcolor="#07111b",
+        font=dict(color="#f5f7fa"),
+        margin=dict(l=20, r=20, t=60, b=20),
+        showlegend=False,
+    )
+    return fig
+
+
 # ─── Tab 1: Price & Regime Overlay ────────────────────────────────────────────
 
 def regime_price_chart(

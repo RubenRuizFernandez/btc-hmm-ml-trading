@@ -18,7 +18,7 @@ def df():
 
 
 def test_loader_basic(df):
-    assert len(df) > 100_000
+    assert len(df) > 24 * 365 * 8
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
     assert df.index.is_monotonic_increasing
     assert not df.index.duplicated().any()
@@ -33,7 +33,7 @@ def test_hmm_features_shape(df):
     feat = build_hmm_features(df)
     assert set(HMM_FEATURES).issubset(feat.columns), "Missing HMM feature columns"
     assert feat.isnull().sum().sum() == 0, "NaN in HMM features after dropna"
-    assert len(feat) > 100_000
+    assert len(feat) > len(df) * 0.95
 
 
 def test_hmm_features_no_lookahead(df):

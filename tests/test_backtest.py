@@ -124,3 +124,25 @@ def test_flat_equity_gives_zero_sharpe():
     eq = pd.Series(np.ones(100), index=pd.date_range("2020", periods=100, freq="h", tz="UTC"))
     m = compute_metrics(eq)
     assert np.isnan(m["sharpe"]) or abs(m["sharpe"]) < 1e-6
+
+
+def test_metrics_include_trade_statistics_and_stagnation():
+    idx = pd.date_range("2020-01-01", periods=5, freq="h", tz="UTC")
+    eq = pd.Series([1.0, 1.05, 1.05, 1.02, 1.08], index=idx)
+    trades = pd.DataFrame(
+        {
+            "pnl_pct": [0.02, -0.01],
+            "net_pnl": [400.0, -200.0],
+            "entry_time": [idx[0], idx[2]],
+            "exit_time": [idx[1], idx[4]],
+        }
+    )
+
+    metrics = compute_metrics(eq, trades)
+
+    assert metrics["win_rate"] == pytest.approx(0.5)
+    assert metrics["avg_win_pnl"] == pytest.approx(400.0)
+    assert metrics["avg_loss_pnl"] == pytest.approx(-200.0)
+    assert metrics["mean_open_hours"] == pytest.approx(1.5)
+    assert metrics["stagnation_days"] == pytest.approx(3 / 24)
+    assert metrics["n_trades"] == 2

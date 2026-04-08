@@ -1,220 +1,318 @@
-"""Functional trading strategy backtest with fixed sizing and hard stop loss.
-
-Rules
------
-Account   : $100,000 (configurable)
-Position  : 40% margin → $40,000 max notional, divided into 3 units
-              Super Bull / Super Bear → 3 units ($40K)
-              Strong Bull / Strong Bear → 2 units ($26.7K)
-              Bull / Bear → 1 unit ($13.3K)
-              Sideways → flat
-Stop-loss : Hard SL at ±3% of account ($3,000).  Checked every bar.
-Entry     : When regime transitions to a new state.
-Exit      : Regime change OR hard SL — whichever comes first.
-Fees      : 0.1% per side on notional + 5 bps slippage.
-"""
+"""Functional trading backtest with static buying power and fixed trade risk."""
 from __future__ import annotations
+
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
 
-from src.config import FEE_RATE, SLIPPAGE_BPS
+from src.config import (
+    APP_ACCOUNT_SIZE,
+    APP_MAX_BUYING_POWER_PCT,
+    APP_RISK_PER_TRADE_PCT,
+    FEE_RATE,
+    SLIPPAGE_BPS,
+)
 
-SLIPPAGE = SLIPPAGE_BPS * 1e-4
+DEFAULT_REGIME_UNITS: dict[int, int] = {0: 3, 1: 2, 2: 1, 3: 0, 4: -1, 5: -2, 6: -3}
 
-# Regime → signed units: +3 long … -3 short
-DEFAULT_REGIME_UNITS = {0: 3, 1: 2, 2: 1, 3: 0, 4: -1, 5: -2, 6: -3}
+
+@dataclass(frozen=True)
+class FunctionalTradeConfig:
+    """Static operating model for the trading app."""
+
+    account_size: float = APP_ACCOUNT_SIZE
+    buying_power_pct: float = APP_MAX_BUYING_POWER_PCT
+    risk_per_trade_pct: float = APP_RISK_PER_TRADE_PCT
+    regime_units: dict[int, int] = field(default_factory=lambda: DEFAULT_REGIME_UNITS.copy())
+    fee_rate: float = FEE_RATE
+    slippage_bps: float = SLIPPAGE_BPS
+
+    def __post_init__(self) -> None:
+        if self.account_size <= 0:
+            raise ValueError("account_size must be positive")
+        if not 0 < self.buying_power_pct <= 1:
+            raise ValueError("buying_power_pct must be in (0, 1]")
+        if not 0 < self.risk_per_trade_pct <= 1:
+            raise ValueError("risk_per_trade_pct must be in (0, 1]")
+        if not self.regime_units:
+            raise ValueError("regime_units cannot be empty")
+        if self.max_units <= 0:
+            raise ValueError("regime_units must contain at least one non-zero position")
+
+    @property
+    def max_units(self) -> int:
+        return max(abs(units) for units in self.regime_units.values())
+
+    @property
+    def max_notional(self) -> float:
+        return self.account_size * self.buying_power_pct
+
+    @property
+    def unit_notional(self) -> float:
+        return self.max_notional / self.max_units
+
+    @property
+    def risk_budget(self) -> float:
+        return self.account_size * self.risk_per_trade_pct
 
 
 @dataclass
 class FunctionalResult:
-    equity_curve: pd.Series       # mark-to-market account value (hourly)
-    trades: pd.DataFrame          # completed trade log
-    open_position: dict | None    # position still open at end (or None)
-
+    equity_curve: pd.Series
+    trades: pd.DataFrame
+    open_position: dict | None
+    config: FunctionalTradeConfig
     _metrics: dict | None = None
 
     @property
     def metrics(self) -> dict:
         if self._metrics is None:
             from src.backtest.metrics import compute_metrics
+
+            normalized_equity = self.equity_curve / self.config.account_size
             self._metrics = compute_metrics(
-                self.equity_curve / self.equity_curve.iloc[0],
+                normalized_equity,
                 self.trades if len(self.trades) > 0 else None,
             )
-            # Add dollar-specific metrics
-            self._metrics["starting_capital"] = float(self.equity_curve.iloc[0])
+            self._metrics["starting_capital"] = float(self.config.account_size)
             self._metrics["ending_capital"] = float(self.equity_curve.iloc[-1])
-            self._metrics["net_pnl"] = float(
-                self.equity_curve.iloc[-1] - self.equity_curve.iloc[0]
-            )
+            self._metrics["net_pnl"] = float(self.equity_curve.iloc[-1] - self.config.account_size)
         return self._metrics
 
 
 def run_functional_strategy(
-    close: pd.Series,
+    market_data: pd.DataFrame | pd.Series,
     regime_state: pd.Series,
-    account_size: float = 100_000,
-    margin_pct: float = 0.40,
-    max_loss_pct: float = 0.03,
-    regime_units: dict = DEFAULT_REGIME_UNITS,
-    fee_rate: float = FEE_RATE,
-    slippage_bps: float = SLIPPAGE_BPS,
-    sl_cooldown_bars: int = 24,
+    config: FunctionalTradeConfig | None = None,
 ) -> FunctionalResult:
-    """
-    Run a functional dollar-denominated backtest.
+    """Run the functional strategy using static buying power and hard stop risk."""
+    cfg = config or FunctionalTradeConfig()
+    market = _coerce_market_data(market_data).reindex(regime_state.index)
+    regimes = regime_state.reindex(market.index)
 
-    Parameters
-    ----------
-    close           : hourly BTC/USD closing prices
-    regime_state    : integer regime per bar (0=Super Bull … 6=Super Bear)
-    account_size    : starting account in USD
-    margin_pct      : fraction of account used as max position (0.40 = 40%)
-    max_loss_pct    : hard stop-loss as fraction of account (0.03 = 3%)
-    regime_units    : mapping {regime_idx → signed units (-3 to +3)}
-    fee_rate        : fee per side as fraction of notional
-    slippage_bps    : adverse slippage in basis points
-    sl_cooldown_bars: bars to wait before re-entering after a stop-loss
+    valid_mask = market[["close", "high", "low"]].notna().all(axis=1) & regimes.notna()
+    market = market.loc[valid_mask]
+    regimes = regimes.loc[valid_mask].astype(int)
 
-    Returns
-    -------
-    FunctionalResult with equity curve, trade log, and metrics.
-    """
-    slippage = slippage_bps * 1e-4
-    n_units_max = max(abs(v) for v in regime_units.values())
-    unit_size = account_size * margin_pct / n_units_max      # $ per unit
-    max_loss = account_size * max_loss_pct                    # hard SL in $
+    if market.empty:
+        raise ValueError("No valid market data is available for the selected range")
 
-    close = close.reindex(regime_state.index)
-    n = len(close)
-    px = close.values.astype(float)
-    regimes = regime_state.values.astype(int)
+    close = market["close"].to_numpy(dtype=float)
+    high = market["high"].to_numpy(dtype=float)
+    low = market["low"].to_numpy(dtype=float)
+    regime_arr = regimes.to_numpy(dtype=int)
+    index = market.index
 
-    equity_arr = np.full(n, account_size)
-    cash = float(account_size)      # realized cash balance
-    pos_units = 0                   # signed units currently held
-    pos_notional = 0.0              # absolute notional of open position
+    n_bars = len(market)
+    slippage = cfg.slippage_bps * 1e-4
+    entry_fee_rate = cfg.fee_rate
+    exit_fee_rate = cfg.fee_rate
+
+    equity = np.full(n_bars, cfg.account_size, dtype=float)
+    cash = float(cfg.account_size)
+
+    pos_units = 0
+    pos_notional = 0.0
     entry_price = 0.0
+    entry_fee = 0.0
+    stop_price = 0.0
     entry_bar = -1
-    entry_time = None
-    sl_cooldown = 0                 # bars remaining before re-entry allowed
+    entry_account_value = 0.0
+
     trade_rows: list[dict] = []
 
-    def _close_position(bar_idx: int, reason: str):
-        nonlocal cash, pos_units, pos_notional, entry_price, entry_bar
-        fill = px[bar_idx] * (1.0 - np.sign(pos_units) * slippage)
-        gross_pnl = pos_notional * (fill / entry_price - 1.0) * np.sign(pos_units)
-        exit_fee = pos_notional * fee_rate
-        net_pnl = gross_pnl - exit_fee
-        cash += net_pnl
+    def close_position(bar_idx: int, exit_price: float, reason: str) -> None:
+        nonlocal cash, pos_units, pos_notional, entry_price, entry_fee
+        nonlocal stop_price, entry_bar, entry_account_value
 
-        sl_price = _compute_sl_price()
-        trade_rows.append({
-            "trade_no": len(trade_rows) + 1,
-            "entry_time": close.index[entry_bar],
-            "exit_time": close.index[bar_idx],
-            "direction": "LONG" if pos_units > 0 else "SHORT",
-            "units": abs(pos_units),
-            "entry_price": round(entry_price, 2),
-            "exit_price": round(fill, 2),
-            "sl_price": round(sl_price, 2),
-            "notional": round(pos_notional, 2),
-            "gross_pnl": round(gross_pnl, 2),
-            "fees": round(exit_fee + pos_notional * fee_rate, 2),
-            "net_pnl": round(net_pnl, 2),
-            "exit_reason": reason,
-            "account_after": round(cash, 2),
-        })
+        exit_fee = pos_notional * exit_fee_rate
+        gross_pnl = pos_notional * (exit_price / entry_price - 1.0) * np.sign(pos_units)
+        cash += gross_pnl - exit_fee
+
+        net_pnl = cash - entry_account_value
+        trade_rows.append(
+            {
+                "trade_no": len(trade_rows) + 1,
+                "entry_time": index[entry_bar],
+                "exit_time": index[bar_idx],
+                "direction": "LONG" if pos_units > 0 else "SHORT",
+                "units": abs(pos_units),
+                "entry_price": round(entry_price, 2),
+                "exit_price": round(exit_price, 2),
+                "sl_price": round(stop_price, 2),
+                "notional": round(pos_notional, 2),
+                "max_loss": round(cfg.risk_budget, 2),
+                "gross_pnl": round(gross_pnl, 2),
+                "fees": round(entry_fee + exit_fee, 2),
+                "net_pnl": round(net_pnl, 2),
+                "pnl_pct": net_pnl / cfg.account_size,
+                "risk_multiple": net_pnl / cfg.risk_budget,
+                "exit_reason": reason,
+                "account_after": round(cash, 2),
+            }
+        )
+
         pos_units = 0
         pos_notional = 0.0
         entry_price = 0.0
+        entry_fee = 0.0
+        stop_price = 0.0
         entry_bar = -1
+        entry_account_value = 0.0
 
-    def _open_position(bar_idx: int, units: int):
-        nonlocal cash, pos_units, pos_notional, entry_price, entry_bar, entry_time
-        pos_notional = abs(units) * unit_size
-        entry_price = px[bar_idx] * (1.0 + np.sign(units) * slippage)
-        entry_fee = pos_notional * fee_rate
+    def open_position(bar_idx: int, units: int) -> None:
+        nonlocal cash, pos_units, pos_notional, entry_price, entry_fee
+        nonlocal stop_price, entry_bar, entry_account_value
+
+        entry_account_value = cash
+        pos_notional = abs(units) * cfg.unit_notional
+        entry_price = _apply_entry_slippage(close[bar_idx], units, slippage)
+        entry_fee = pos_notional * entry_fee_rate
         cash -= entry_fee
+
         pos_units = units
         entry_bar = bar_idx
-        entry_time = close.index[bar_idx]
+        stop_price = _compute_stop_price(
+            entry_price=entry_price,
+            units=units,
+            notional=pos_notional,
+            risk_budget=cfg.risk_budget,
+            entry_fee=entry_fee,
+            exit_fee_rate=exit_fee_rate,
+        )
 
-    def _compute_sl_price() -> float:
-        """Hard-SL price for the current position."""
-        if pos_units == 0 or entry_price == 0:
-            return 0.0
-        # max_loss = notional * |price_move / entry_price|
-        # price_move = max_loss / notional * entry_price
-        move = max_loss / pos_notional * entry_price
-        if pos_units > 0:
-            return entry_price - move   # long: SL below entry
-        else:
-            return entry_price + move   # short: SL above entry
+    for i in range(n_bars):
+        desired_units = cfg.regime_units.get(regime_arr[i], 0)
 
-    # ── Main loop ────────────────────────────────────────────────────────────
-    for i in range(n):
-        desired_units = regime_units.get(regimes[i], 0)
+        if pos_units != 0 and _stop_was_hit(pos_units, low[i], high[i], stop_price):
+            close_position(i, stop_price, "STOP LOSS")
+            equity[i] = cash
+            continue
 
-        # ── Check hard stop-loss ─────────────────────────────────────────────
-        if pos_units != 0:
-            unrealized = pos_notional * (px[i] / entry_price - 1.0) * np.sign(pos_units)
-            if unrealized <= -max_loss:
-                _close_position(i, "STOP LOSS")
-                sl_cooldown = sl_cooldown_bars
-                # Mark equity and skip to next bar
-                equity_arr[i] = cash
-                continue
+        if pos_units != 0 and desired_units != pos_units:
+            exit_price = _apply_exit_slippage(close[i], pos_units, slippage)
+            close_position(i, exit_price, "REGIME CHANGE")
 
-        # ── Cooldown after stop-loss ─────────────────────────────────────────
-        if sl_cooldown > 0:
-            sl_cooldown -= 1
-            if pos_units == 0:
-                equity_arr[i] = cash
-                continue
+        if pos_units == 0 and desired_units != 0:
+            open_position(i, desired_units)
 
-        # ── Regime changed → adjust position ─────────────────────────────────
-        if desired_units != pos_units:
-            # Close current
-            if pos_units != 0:
-                _close_position(i, "REGIME CHANGE")
+        equity[i] = cash if pos_units == 0 else cash + _mark_to_market_pnl(
+            close_price=close[i],
+            entry_price=entry_price,
+            units=pos_units,
+            notional=pos_notional,
+        )
 
-            # Open new
-            if desired_units != 0:
-                _open_position(i, desired_units)
-
-        # ── Mark-to-market equity ────────────────────────────────────────────
-        if pos_units != 0 and entry_price > 0:
-            unrealized = pos_notional * (px[i] / entry_price - 1.0) * np.sign(pos_units)
-            equity_arr[i] = cash + unrealized
-        else:
-            equity_arr[i] = cash
-
-    # ── Close open position at final bar ─────────────────────────────────────
-    open_pos = None
+    open_position_snapshot = None
     if pos_units != 0:
-        sl_price = _compute_sl_price()
-        unrealized = pos_notional * (px[-1] / entry_price - 1.0) * np.sign(pos_units)
-        open_pos = {
+        unrealized_pnl = cash + _mark_to_market_pnl(
+            close_price=close[-1],
+            entry_price=entry_price,
+            units=pos_units,
+            notional=pos_notional,
+        ) - entry_account_value
+        open_position_snapshot = {
             "direction": "LONG" if pos_units > 0 else "SHORT",
             "units": abs(pos_units),
-            "entry_time": close.index[entry_bar],
+            "entry_time": index[entry_bar],
             "entry_price": round(entry_price, 2),
-            "current_price": round(px[-1], 2),
-            "sl_price": round(sl_price, 2),
+            "current_price": round(close[-1], 2),
+            "sl_price": round(stop_price, 2),
             "notional": round(pos_notional, 2),
-            "unrealized_pnl": round(unrealized, 2),
+            "risk_budget": round(cfg.risk_budget, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
         }
 
-    eq_series = pd.Series(equity_arr, index=close.index, name="equity")
-    trades_df = (
-        pd.DataFrame(trade_rows) if trade_rows
-        else pd.DataFrame(columns=[
-            "trade_no", "entry_time", "exit_time", "direction", "units",
-            "entry_price", "exit_price", "sl_price", "notional",
-            "gross_pnl", "fees", "net_pnl", "exit_reason", "account_after",
-        ])
+    trade_columns = [
+        "trade_no",
+        "entry_time",
+        "exit_time",
+        "direction",
+        "units",
+        "entry_price",
+        "exit_price",
+        "sl_price",
+        "notional",
+        "max_loss",
+        "gross_pnl",
+        "fees",
+        "net_pnl",
+        "pnl_pct",
+        "risk_multiple",
+        "exit_reason",
+        "account_after",
+    ]
+    trades = (
+        pd.DataFrame(trade_rows)
+        if trade_rows
+        else pd.DataFrame(columns=trade_columns)
     )
-    return FunctionalResult(eq_series, trades_df, open_pos)
+
+    return FunctionalResult(
+        equity_curve=pd.Series(equity, index=index, name="equity"),
+        trades=trades,
+        open_position=open_position_snapshot,
+        config=cfg,
+    )
+
+
+def _coerce_market_data(market_data: pd.DataFrame | pd.Series) -> pd.DataFrame:
+    if isinstance(market_data, pd.Series):
+        return pd.DataFrame(
+            {
+                "close": market_data.astype(float),
+                "high": market_data.astype(float),
+                "low": market_data.astype(float),
+            }
+        )
+
+    if not isinstance(market_data, pd.DataFrame):
+        raise TypeError("market_data must be a pandas Series or DataFrame")
+
+    if "close" not in market_data.columns:
+        raise ValueError("market_data must contain a 'close' column")
+
+    close = market_data["close"].astype(float)
+    high = market_data["high"].astype(float) if "high" in market_data else close
+    low = market_data["low"].astype(float) if "low" in market_data else close
+    return pd.DataFrame({"close": close, "high": high, "low": low}, index=market_data.index)
+
+
+def _apply_entry_slippage(price: float, units: int, slippage: float) -> float:
+    return price * (1.0 + np.sign(units) * slippage)
+
+
+def _apply_exit_slippage(price: float, units: int, slippage: float) -> float:
+    return price * (1.0 - np.sign(units) * slippage)
+
+
+def _mark_to_market_pnl(
+    close_price: float,
+    entry_price: float,
+    units: int,
+    notional: float,
+) -> float:
+    return notional * (close_price / entry_price - 1.0) * np.sign(units)
+
+
+def _compute_stop_price(
+    entry_price: float,
+    units: int,
+    notional: float,
+    risk_budget: float,
+    entry_fee: float,
+    exit_fee_rate: float,
+) -> float:
+    exit_fee = notional * exit_fee_rate
+    available_price_risk = max(risk_budget - entry_fee - exit_fee, 0.0)
+    stop_move = available_price_risk / notional if notional else 0.0
+    if units > 0:
+        return entry_price * (1.0 - stop_move)
+    return entry_price * (1.0 + stop_move)
+
+
+def _stop_was_hit(units: int, low_price: float, high_price: float, stop_price: float) -> bool:
+    if units > 0:
+        return low_price <= stop_price
+    return high_price >= stop_price

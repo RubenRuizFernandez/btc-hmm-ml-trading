@@ -1,11 +1,13 @@
 """Tests for walk-forward engine."""
 import sys
 from pathlib import Path
+from functools import partial
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import pandas as pd
 import pytest
+from dateutil.relativedelta import relativedelta
 
 from src.data.loader import load_raw
 from src.walkforward.wf_engine import _fold_dates, _empty_fold
@@ -34,7 +36,6 @@ def test_fold_dates_no_overlap(df):
 def test_fold_dates_advancing(df):
     """Each fold's OOS should advance by WF_STEP_MONTHS."""
     folds = _fold_dates(df)
-    from dateutil.relativedelta import relativedelta
     for i in range(1, len(folds)):
         prev_oos = folds[i - 1][1]
         curr_oos = folds[i][1]
@@ -46,9 +47,9 @@ def test_fold_dates_min_is_coverage(df):
     """First fold IS must cover at least WF_IS_MIN_YEARS."""
     folds = _fold_dates(df)
     is_start, oos_start, _ = folds[0]
-    years_covered = (oos_start - is_start).days / 365.25
-    assert years_covered >= WF_IS_MIN_YEARS, \
-        f"IS too short: {years_covered:.1f} years (min={WF_IS_MIN_YEARS})"
+    expected_start = is_start + relativedelta(years=WF_IS_MIN_YEARS)
+    assert oos_start >= expected_start, \
+        f"IS too short: first OOS starts at {oos_start}, expected at least {expected_start}"
 
 
 def test_empty_fold_valid():
@@ -58,10 +59,15 @@ def test_empty_fold_valid():
     assert np.isnan(result.metrics["sharpe"])
 
 
-def test_smoke_wf_2_folds(df):
+def test_smoke_wf_2_folds(df, monkeypatch):
     """Run 2 folds end-to-end to verify no crash (slow, uses real models)."""
-    from src.walkforward.wf_engine import run_walk_forward
-    results = run_walk_forward(df, n_folds=2, save_results=False)
+    from src.regime.hmm_model import BTCHMMModel
+    import src.walkforward.wf_engine as wf_engine
+
+    monkeypatch.setattr(wf_engine._cfg, "LSTM_EPOCHS", 0, raising=False)
+    monkeypatch.setattr(wf_engine, "BTCHMMModel", partial(BTCHMMModel, n_restarts=1))
+
+    results = wf_engine.run_walk_forward(df, n_folds=2, save_results=False)
     assert len(results) == 2
     for r in results:
         assert hasattr(r, "metrics")

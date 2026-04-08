@@ -139,5 +139,7 @@ def extract_regime_series(posteriors: np.ndarray) -> tuple:
     """
     state = posteriors.argmax(axis=1)
     confidence = posteriors.max(axis=1)
-    entropy = -np.sum(posteriors * np.log(posteriors + 1e-9), axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        entropy_terms = np.where(posteriors > 0.0, posteriors * np.log(posteriors), 0.0)
+    entropy = np.maximum(-np.sum(entropy_terms, axis=1), 0.0)
     return state, confidence, entropy
